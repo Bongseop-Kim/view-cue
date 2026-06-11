@@ -173,7 +173,7 @@
 | 필드 | 타입 | 설명 |
 |------|------|------|
 | `question_id` | uuid | 답변한 질문 |
-| `video` | file | 영상 (mp4/mov, 권장 ≤ 200MB) |
+| `video` | file | 영상 (mp4/mov, 권장 ≤ 200MB, 길이 상한 약 13분 — Whisper API 25MB 제한 기준 서버 검증) |
 | `retry_of` | uuid? | 재도전 시 이전 answer id (Step 6) |
 
 응답 `202 Accepted` — 분석 파이프라인(ffmpeg → STT/지표 → LLM 피드백) 시작:
@@ -232,6 +232,7 @@
 ```
 
 - 5축 `scores`: `content`(내용 충실도·관련성), `star`(STAR 구조), `voice`(음성), `gaze`(시선 — 정면 응시 추정), `delivery`(전달력). 0~100.
+- `filler_count`는 근사치 — STT(Whisper)가 필러를 정규화·누락하는 경향이 있어 프롬프트로 보존을 유도하지만 보장되지 않는다 (Phase 4 검증에서 검출률 확인).
 - `failed` 시: `{ "status": "failed", "error": { "code": "STT_FAILED", "message": "..." } }`
 
 ### GET /answers/{answer_id}/comparison (Step 6 비교)
@@ -292,7 +293,13 @@
 ```
 
 - `peer_avg`/`peer_percentile`: MVP에서는 고정 기준값 테이블 사용, 추후 실데이터 기반 갱신 (Phase 8)
-- `deep_analysis`: 프론트의 Pro 영역. 노출 제어는 프론트/요금제 책임 — API는 항상 반환
+- `deep_analysis`: **Pro 전용** — 백엔드가 `profiles.plan`을 확인해 free 사용자에게는 본문을 제외하고 잠금 표시만 반환한다(Phase 6). 프론트 잠금 UI는 UX용이고 백엔드가 최종 방어선.
+
+  free 사용자 응답:
+
+  ```json
+  "deep_analysis": { "locked": true }
+  ```
 
 ---
 

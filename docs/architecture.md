@@ -22,8 +22,9 @@
 [FastAPI 서버 (view-cue)]
     │
     ├─ ffmpeg ──────── 영상 → 오디오(wav) + 프레임 분리
-    ├─ OpenAI Whisper ─ 오디오 → 한국어 transcript (STT)
-    ├─ VAD·librosa·parselmouth ─ 오디오 지표 산출 (AudioMetrics)
+    ├─ silero-vad ──── 발화/침묵 구간 검출 (침묵 지표 + STT 입력 선별)
+    ├─ OpenAI whisper-1 ─ 발화 구간 → 한국어 transcript (STT, word timestamps)
+    ├─ librosa·parselmouth ─ 오디오 지표 산출 (AudioMetrics)
     ├─ OpenCV + MediaPipe Face Landmarker ─ 영상 지표 산출 (VideoMetrics)
     ├─ OpenAI GPT ──── 질문+transcript+이력서/JD요약+metrics → 피드백/리포트
     │
@@ -37,27 +38,29 @@
 
 1. **수신**: `POST /sessions/{id}/answers`로 영상 multipart 수신 → 임시 디렉터리 저장, `answers.status = processing`, 202 응답
 2. **분리**: ffmpeg로 오디오(16kHz mono wav)와 프레임(샘플링) 추출
-3. **분석** (병렬 가능):
-   - STT: Whisper API → transcript (+ 단어 타임스탬프)
-   - 오디오 지표: VAD로 발화/침묵 구간 → 말 빠르기, 침묵, 멈춤, 필러 / librosa·parselmouth → 에너지, 음량 변화, 피치 변화, 억양 단조로움
+3. **분석** (오디오/영상 트랙은 병렬 가능, 오디오 트랙 내부는 순차):
+   - VAD: silero-vad(ONNX, torch 불필요)로 발화/침묵 구간 검출 → 침묵·멈춤 지표 + STT에 투입할 발화 구간 선별 (Whisper 무음 환각 방지 + 비용 절감)
+   - STT: whisper-1 고정 (word-level 타임스탬프는 whisper-1만 지원 — gpt-4o-transcribe 미지원) → transcript. prompt에 한국어 필러 예시를 넣어 필러 보존 유도
+   - 오디오 지표: STT 타임스탬프 → 말 빠르기 / transcript 매칭 → 필러 / librosa·parselmouth → 에너지, 음량 변화, 피치 변화, 억양 단조로움
    - 영상 지표: MediaPipe Face Landmarker → 얼굴 감지율, 중앙 유지율, 고개 이탈, 정면 응시 추정, 미검출 시간
 4. **저장**: transcript + metrics JSON을 `answers`에 저장
 5. **해석**: LLM에 질문/transcript/이력서·JD 요약/metrics 입력 → 5축 점수, good/fix 코멘트, 개선 답변, 꼬리질문 생성·저장
 6. **정리**: 임시 오디오·프레임 즉시 삭제, 원본 영상은 보관 정책(`VIDEO_RETENTION_HOURS`)에 따라 삭제 또는 단기 보관
 7. **완료**: `answers.status = done` (실패 시 `failed` + 오류 기록)
 
-비동기 실행은 MVP에서 FastAPI BackgroundTasks를 사용하되, 잡 상태를 DB에 기록하고
-`app/core/jobs.py` 추상화 뒤에 실행 방식을 숨겨 추후 Celery/ARQ 등 큐로 교체할 수 있게 한다.
+비동기 실행은 MVP에서 FastAPI BackgroundTasks를 사용하되, CPU-bound 분석(MediaPipe·librosa·parselmouth 등)은
+`app/core/jobs.py`의 ProcessPoolExecutor 실행기로 격리한다 — GIL로 인한 이벤트 루프(헬스체크·폴링 응답) 블로킹 방지.
+잡 상태를 DB에 기록하고 jobs.py 추상화 뒤에 실행 방식을 숨겨 추후 Celery/ARQ 등 큐로 교체할 수 있게 한다.
 
 ## metrics JSON 정의 (`app/schemas/metrics.py`)
 
 | 그룹 | 필드 | 의미 | 산출 도구 |
 |------|------|------|----------|
 | 공통 | `duration_seconds` | 답변 길이(초) | ffmpeg |
-| audio | `speech_rate_wpm` | 말 빠르기 (분당 단어/어절 수) | STT 타임스탬프 + VAD |
-| audio | `silent_seconds` | 총 침묵 시간(초) | VAD |
-| audio | `pause_count` | 일정 길이 이상 멈춤 횟수 | VAD |
-| audio | `filler_count` | 필러 단어 수 ("음", "어", "그") | transcript 매칭 |
+| audio | `speech_rate_wpm` | 말 빠르기 (분당 단어/어절 수) | STT(whisper-1) word 타임스탬프 |
+| audio | `silent_seconds` | 총 침묵 시간(초) | silero-vad |
+| audio | `pause_count` | 일정 길이 이상 멈춤 횟수 | silero-vad |
+| audio | `filler_count` | 필러 단어 수 ("음", "어", "그") — 근사치 (Whisper 필러 정규화 경향) | transcript 매칭 |
 | audio | `pitch_variation` | 피치 변화 (F0 표준편차) | parselmouth |
 | audio | `energy_mean` | 평균 발화 에너지 (RMS) | librosa |
 | audio | `volume_variation` | 음량 변화 | librosa |
